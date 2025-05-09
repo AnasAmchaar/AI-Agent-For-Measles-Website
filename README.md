@@ -28,3 +28,9 @@ An intelligent assistant that powers a **Measles Awareness Website**, helping us
    ```bash
    git clone https://github.com/AnasAmchaar/AI-Agent-For-Measles-Website.git
    cd AI-Agent-For-Measles-Website
+
+
+## WHO AM I?
+Anas Amchaar, AI/ML engineering student from Morocco.
+Want to know more about me? check my profil and my LinkedIn:
+https://github.com/AnasAmchaar

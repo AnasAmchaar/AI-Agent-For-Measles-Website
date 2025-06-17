@@ -18,8 +18,8 @@ An intelligent assistant that powers a **Measles Awareness Website**, helping us
 
 - **Python**, **LangChain**, **FastAPI**  
 - **OpenAI / Hugging Face** LLMs  
-- **Vector DB:** FAISS / ChromaDB
-  
+- **Vector DB:** FAISS 
+- **Model:** UBC-NLP/NileChat-3B
 ---
 
 ## 🏁 Getting Started

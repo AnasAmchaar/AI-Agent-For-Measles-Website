@@ -10,8 +10,11 @@ import re
 import redis
 import hashlib
 import uuid
-from google import genai
-from google.genai import types
+from together import Together
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 # === Redis Setup ===
 REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
@@ -34,7 +37,7 @@ class AgentState(TypedDict):
     context: str
     answer: Union[str, List[dict]]
 
-DATA_PATH = "/content/mm7345a4-H.pdf"
+DATA_PATH = "data/mm7345a4-H.pdf"
 CHUNK_SIZE = 200
 CHUNK_OVERLAP = 50
 
@@ -71,10 +74,17 @@ def chunk_text(text: str) -> List[str]:
         chunks.append(' '.join(chunk))
     return chunks
 
-raw_text = extract_text_from_pdf(DATA_PATH)
-cleaned_text = clean_text(raw_text)
-chunks = chunk_text(cleaned_text)
-metadata = [{"source": "WHO Measles Fact Sheet", "id": i} for i in range(len(chunks))]
+# Check if PDF file exists
+if not os.path.exists(DATA_PATH):
+    print(f"[ERROR] PDF file not found at {DATA_PATH}")
+    print("Please ensure the PDF file is in the data/ directory")
+    chunks = []
+    metadata = []
+else:
+    raw_text = extract_text_from_pdf(DATA_PATH)
+    cleaned_text = clean_text(raw_text)
+    chunks = chunk_text(cleaned_text)
+    metadata = [{"source": "WHO Measles Fact Sheet", "id": i} for i in range(len(chunks))]
 
 embedder = SentenceTransformer("sentence-transformers/LaBSE")
 reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
@@ -84,7 +94,14 @@ dimension = embeddings.shape[1]
 index = faiss.IndexFlatL2(dimension)
 index.add(embeddings)
 
-genai_client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
+# Check for Together API key
+together_api_key = os.environ.get("TOGETHER_API_KEY")
+if not together_api_key:
+    print("[ERROR] TOGETHER_API_KEY environment variable not set")
+    print("Please set your Together AI API key: export TOGETHER_API_KEY=your_key_here")
+    together_client = None
+else:
+    together_client = Together(api_key=together_api_key)
 
 def compute_cache_key(query: str, mode: str) -> str:
     return hashlib.sha256(f"{mode}:{query}".encode("utf-8")).hexdigest()
@@ -138,26 +155,40 @@ def save_history(session_id: str, query: str, answer: Union[str, List[dict]]):
         with open(file, "w") as f:
             json.dump(data, f, indent=2)
 
-def gemini_chat_completion(context_messages: List[str], user_query: str) -> str:
-    prompt = "\n".join(context_messages[-4:] + [f"User: {user_query}"])
-    contents = [
-        types.Content(
-            role="user",
-            parts=[types.Part(text=prompt)]
-        )
-    ]
-    config = types.GenerateContentConfig(
-        thinking_config=types.ThinkingConfig(thinking_budget=-1),
-        response_mime_type="text/plain"
-    )
+def together_chat_completion(context_messages: List[str], user_query: str) -> str:
+    if not together_client:
+        return "Error: Together AI client not initialized. Please check your API key."
+    
+    # Build conversation history
+    messages = []
+    
+    # Add system message
+    system_message = {
+        "role": "system",
+        "content": "You are a highly reliable and factual health assistant specialized in measles-related public information. You operate inside a retrieval-augmented generation (RAG) system and must always ground your responses strictly on the documents retrieved by your tools.\n\nAlways:\n\nSummarize clearly and accurately, using only the retrieved content.\n\nCite the relevant source or section if needed (by title or identifier).\n\nUse simple, understandable language for the general public (no medical jargon unless explained).\n\nIf the information is not found, say so clearly and do not hallucinate or assume anything.\n\nYour main goals:\n\nHelp users understand symptoms, vaccines, outbreak news, and prevention measures.\n\nWarn users about misinformation and guide them to evidence-based practices.\n\nProvide trusted, actionable, and verified insights without making medical diagnoses.\n\nAlways maintain a neutral, reassuring, and educational tone. You are not a doctor, but a public-facing, AI-powered explainer focused on helping people stay safe and informed about measles."
+    }
+    messages.append(system_message)
+    
+    # Add conversation history
+    for msg in context_messages[-4:]:
+        if msg.startswith("User: "):
+            messages.append({"role": "user", "content": msg[6:]})
+        elif msg.startswith("Assistant: "):
+            messages.append({"role": "assistant", "content": msg[11:]})
+    
+    # Add current user query
+    messages.append({"role": "user", "content": user_query})
+    
     output = ""
     try:
-        for chunk in genai_client.models.generate_content_stream(
-            model="gemini-2.5-pro",
-            contents=contents,
-            config=config
-        ):
-            output += chunk.text
+        response = together_client.chat.completions.create(
+            model="google/gemma-3n-E4B-it",
+            messages=messages,
+            stream=True
+        )
+        for token in response:
+            if hasattr(token, 'choices') and token.choices[0].delta.content:
+                output += token.choices[0].delta.content
     except Exception as e:
         print(f"[GEN ERROR] {e}")
         return "Error during generation."
@@ -165,27 +196,52 @@ def gemini_chat_completion(context_messages: List[str], user_query: str) -> str:
 
 def generate_answer(state: AgentState) -> dict:
     session_history = get_history(session_id)
-    prompt = (
-        "You are a qualified medical assistant specialized in measles. "
-        "Answer ONLY using the following context. If not in the context, reply 'Not in context'.\n\n"
-        f"Context:\n{state['context']}\n"
-    )
-    response = gemini_chat_completion([prompt] + session_history, state["query"])
+    
+    # Build conversation history for context
+    context_messages = []
+    for msg in session_history[-4:]:
+        context_messages.append(msg)
+    
+    # Add context information to the user query
+    enhanced_query = f"Context:\n{state['context']}\n\nUser question: {state['query']}"
+    
+    response = together_chat_completion(context_messages, enhanced_query)
     return {"answer": response}
 
 def generate_quiz(state: AgentState) -> dict:
-    prompt = (
-        "Generate 3 multiple-choice questions from this medical context. "
-        "Each should have 4 choices (A-D) and the correct answer marked.\n\n"
-        f"Context:\n{state['context']}\n\n"
-        "Output format:\n[{\"question\": ..., \"choices\": [\"A...\", \"B...\", ...], \"answer\": \"A\"}]"
-    )
-    response = gemini_chat_completion([], prompt)
+    if not together_client:
+        return {"answer": [{"question": "Error: Together AI client not initialized. Please check your API key.", "choices": [], "answer": ""}]}
+    
+    messages = [
+        {
+            "role": "system",
+            "content": "You are a highly reliable and factual health assistant specialized in measles-related public information. You operate inside a retrieval-augmented generation (RAG) system and must always ground your responses strictly on the documents retrieved by your tools.\n\nAlways:\n\nSummarize clearly and accurately, using only the retrieved content.\n\nCite the relevant source or section if needed (by title or identifier).\n\nUse simple, understandable language for the general public (no medical jargon unless explained).\n\nIf the information is not found, say so clearly and do not hallucinate or assume anything.\n\nYour main goals:\n\nHelp users understand symptoms, vaccines, outbreak news, and prevention measures.\n\nWarn users about misinformation and guide them to evidence-based practices.\n\nProvide trusted, actionable, and verified insights without making medical diagnoses.\n\nAlways maintain a neutral, reassuring, and educational tone. You are not a doctor, but a public-facing, AI-powered explainer focused on helping people stay safe and informed about measles."
+        },
+        {
+            "role": "user",
+            "content": f"Generate 3 multiple-choice questions from this medical context. Each should have 4 choices (A-D) and the correct answer marked.\n\nContext:\n{state['context']}\n\nOutput format:\n[{{\"question\": ..., \"choices\": [\"A...\", \"B...\", ...], \"answer\": \"A\"}}]"
+        }
+    ]
+    
+    output = ""
     try:
-        start, end = response.find("["), response.rfind("]") + 1
-        quiz = json.loads(response[start:end].replace("'", '"'))
+        response = together_client.chat.completions.create(
+            model="google/gemma-3n-E4B-it",
+            messages=messages,
+            stream=True
+        )
+        for token in response:
+            if hasattr(token, 'choices') and token.choices[0].delta.content:
+                output += token.choices[0].delta.content
     except Exception as e:
         print(f"[QUIZ ERROR] {e}")
+        return {"answer": [{"question": "Error generating quiz", "choices": [], "answer": ""}]}
+    
+    try:
+        start, end = output.find("["), output.rfind("]") + 1
+        quiz = json.loads(output[start:end].replace("'", '"'))
+    except Exception as e:
+        print(f"[QUIZ PARSE ERROR] {e}")
         quiz = [{"question": "Error parsing quiz", "choices": [], "answer": ""}]
     return {"answer": quiz}
 
@@ -248,8 +304,8 @@ demo = gr.Interface(
         gr.Dropdown(choices=["answer", "quiz"], value="answer", label="Mode")
     ],
     outputs=gr.Markdown(label="Output"),
-    title="🧠 Measles Assistant + Quiz Generator (Gemini)",
-    description="Answers medical questions based on WHO data. RAG-powered with Gemini, FAISS, reranker, and Redis."
+    title="🧠 Measles Assistant + Quiz Generator (Together AI)",
+    description="Answers medical questions based on WHO data. RAG-powered with Gemma-3n-E4B-it, FAISS, reranker, and Redis."
 )
 
 if __name__ == "__main__":
